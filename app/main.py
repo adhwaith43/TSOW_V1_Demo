@@ -133,6 +133,19 @@ def get_model_name() -> str:
         raise RuntimeError("LM Studio returned no loaded models. Load a model in LM Studio first.")
     return models[0].get("id", "")
 
+def _message_text(message: dict) -> str:
+    """Handle common OpenAI-compatible message content formats."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+        return "\n".join(parts).strip()
+    return ""
+
 def extract_tsow_fields(questionnaire_text: str, user_prompt: str) -> tuple[dict, str]:
     model_name = get_model_name()
     user_message = f"""
@@ -145,7 +158,8 @@ QUESTIONNAIRE TEXT:
 USER PROMPT / ADDITIONAL CONTEXT:
 {user_prompt.strip() if user_prompt.strip() else "No additional user prompt provided."}
 
-Return all fields. Use null for unsupported or unavailable information.
+Return ONLY one valid JSON object. Include every requested key. Use null when a value is not stated.
+Do not explain your answer. Do not use markdown fences.
 """
     payload = {
         "model": model_name,
@@ -154,43 +168,76 @@ Return all fields. Use null for unsupported or unavailable information.
             {"role": "user", "content": user_message},
         ],
         "temperature": 0,
-        "max_tokens": 3500,
+        "max_tokens": 3000,
         "stream": False,
-        "response_format": {"type": "json_object"},
     }
-    response = requests.post(
-        f"{LM_STUDIO_URL}/chat/completions",
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    if response.status_code >= 400:
-        # Some local model/server combinations reject response_format.
-        payload.pop("response_format", None)
+
+    # Try ordinary chat completion first. Some local models return an empty
+    # message when JSON-constrained output is requested but not supported well.
+    attempts = [
+        ("normal", dict(payload)),
+        ("json_mode", {**payload, "response_format": {"type": "json_object"}}),
+    ]
+    diagnostics = []
+    last_raw = ""
+    for attempt_name, request_payload in attempts:
         response = requests.post(
             f"{LM_STUDIO_URL}/chat/completions",
-            json=payload,
+            json=request_payload,
             timeout=REQUEST_TIMEOUT,
         )
-    response.raise_for_status()
-    body = response.json()
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"LM Studio returned no choices: {body}")
-    raw = choices[0].get("message", {}).get("content", "")
-    parsed = parse_json_response(raw)
+        if response.status_code >= 400:
+            diagnostics.append(
+                f"{attempt_name}: HTTP {response.status_code}: {response.text[:500]}"
+            )
+            continue
+        try:
+            body = response.json()
+        except ValueError:
+            diagnostics.append(f"{attempt_name}: server did not return JSON: {response.text[:500]}")
+            continue
 
-    # Normalize to the exact set of PDF template fields. Ignore unexpected model keys.
-    normalized = {}
-    for field in TSOW_FIELDS:
-        value = parsed.get(field)
-        if value is None:
-            normalized[field] = None
-        elif isinstance(value, (dict, list)):
-            normalized[field] = json.dumps(value, ensure_ascii=False)
-        else:
-            text_value = str(value).strip()
-            normalized[field] = text_value if text_value else None
-    return normalized, model_name
+        choices = body.get("choices") or []
+        if not choices:
+            diagnostics.append(f"{attempt_name}: response has no choices: {str(body)[:700]}")
+            continue
+
+        choice = choices[0]
+        message = choice.get("message") or {}
+        last_raw = _message_text(message)
+        finish_reason = choice.get("finish_reason")
+
+        if not last_raw:
+            diagnostics.append(
+                f"{attempt_name}: empty message content; finish_reason={finish_reason}; "
+                f"message_keys={list(message.keys())}; usage={body.get('usage')}"
+            )
+            continue
+
+        try:
+            parsed = parse_json_response(last_raw)
+        except (ValueError, json.JSONDecodeError) as exc:
+            diagnostics.append(f"{attempt_name}: non-JSON output: {last_raw[:400]} ({exc})")
+            continue
+
+        normalized = {}
+        for field in TSOW_FIELDS:
+            value = parsed.get(field)
+            if value is None:
+                normalized[field] = None
+            elif isinstance(value, (dict, list)):
+                normalized[field] = json.dumps(value, ensure_ascii=False)
+            else:
+                text_value = str(value).strip()
+                normalized[field] = text_value if text_value else None
+        return normalized, model_name
+
+    raise RuntimeError(
+        "LM Studio responded, but the model did not produce a usable JSON object.\n\n"
+        + "\n".join(diagnostics)
+        + "\n\nCheck that a chat/instruct model is loaded, increase its context length in LM Studio, "
+          "and try again. If using a reasoning model, choose a non-thinking instruct model for this demo."
+    )
 
 def main():
     st.set_page_config(page_title="TSOW V1 Demo", page_icon="📄", layout="wide")
